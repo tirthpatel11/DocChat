@@ -92,7 +92,3 @@ DocChat-main/
 │   └── package.json
 └── requirements.txt        # Python dependencies
 ```
-
-## License
-
-MIT
