@@ -1,13 +1,11 @@
 import os
+import math
 import time
-import uuid
 from typing import List, Optional, Tuple
 
 import pdfplumber
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
@@ -17,17 +15,13 @@ from pydantic import BaseModel
 from PIL import Image
 import pytesseract
 
-from utils import groq_llm, huggingface_instruct_embedding
+from utils import groq_llm, huggingface_instruct_embedding, get_reranker
 from config import load_config
 
-
-# Ensure environment variables are loaded before anything else
 load_config()
 
+app = FastAPI(title="DocChat API", version="2.1.0")
 
-app = FastAPI(title="DocChat API", version="1.0.0")
-
-# Allow common frontend origins; adjust as needed in deployment
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,44 +39,66 @@ class SourceChunk(BaseModel):
     content: str
     source: Optional[str] = None
     page: Optional[int] = None
+    relevance: Optional[float] = None
 
 
 class QueryResponse(BaseModel):
     answer: str
     response_time: float
     sources: List[SourceChunk] = []
+    confidence: Optional[str] = None
 
 
-# Global in-memory handle to the current vector store
 VECTOR_STORE = None
 
-
-prompt = ChatPromptTemplate.from_template(
-    """
-    You are an assistant that answers questions strictly using the provided context.
-
-    Guidelines:
-    - Only use information that appears in the <context>.
-    - If the answer is not clearly supported by the context, say
-      "I don't know based on the provided documents."
-    - Prefer short, direct answers over long speculation.
-
-    <context>
-    {context}
-    </context>
-
-    Question: {input}
-    Answer:
-    """
+SYSTEM_PROMPT = (
+    "You are DocChat, a precise AI assistant. "
+    "Answer the user's question using ONLY the numbered document excerpts provided in the conversation. "
+    "Rules:\n"
+    "1. Base your answer strictly on information in the excerpts. Never use outside knowledge.\n"
+    "2. When possible, reference which excerpt supports your claim (e.g. \"According to Excerpt 2…\").\n"
+    "3. Use exact numbers, dates, and names from the excerpts — do not approximate or guess.\n"
+    "4. If the excerpts do not contain enough information, reply: "
+    "\"The provided documents don't contain enough information to answer this question.\"\n"
+    "5. If excerpts seem contradictory, point out the discrepancy.\n"
+    "6. Be concise. Do not repeat the question or add filler."
 )
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    ("human",
+     "Document excerpts:\n\n{context}\n\n---\n\nQuestion: {input}\n\nAnswer:"),
+])
+
+
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def deduplicate_chunks(
+    results: List[Tuple[Document, float]], threshold: float = 0.80
+) -> List[Tuple[Document, float]]:
+    if not results:
+        return results
+
+    unique: List[Tuple[Document, float]] = [results[0]]
+    for doc, score in results[1:]:
+        words_a = set(doc.page_content.lower().split())
+        is_dup = False
+        for existing_doc, _ in unique:
+            words_b = set(existing_doc.page_content.lower().split())
+            if not words_a or not words_b:
+                continue
+            overlap = len(words_a & words_b) / len(words_a | words_b)
+            if overlap > threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append((doc, score))
+    return unique
 
 
 def process_pdf(uploaded_path: str) -> List[Document]:
-    """
-    Load a PDF into page-level documents, plus additional table documents.
-    Tables are converted into a simple markdown-like representation so they
-    can participate in text-based retrieval and Q&A.
-    """
     loader = PyPDFLoader(file_path=uploaded_path)
     documents = loader.load()
 
@@ -94,25 +110,20 @@ def process_pdf(uploaded_path: str) -> List[Document]:
                 for t_idx, table in enumerate(tables):
                     if not table:
                         continue
-                    # Convert table to a markdown-style string
                     rows = [" | ".join(cell or "" for cell in row) for row in table]
                     table_text = "\n".join(rows)
                     if not table_text.strip():
                         continue
-                    meta = {
-                        "source": os.path.basename(uploaded_path),
-                        "source_name": os.path.basename(uploaded_path),
-                        "page": page_index,
-                        "table_index": t_idx,
-                        "is_table": True,
-                    }
-                    table_docs.append(Document(page_content=table_text, metadata=meta))
+                    table_docs.append(
+                        Document(
+                            page_content=table_text,
+                            metadata={"page": page_index, "is_table": True},
+                        )
+                    )
     except Exception:
-        # If table extraction fails, just fall back to text-only pages.
         pass
 
-    base_docs = [Document(page_content=doc.page_content, metadata=doc.metadata) for doc in documents]
-    return base_docs + table_docs
+    return documents + table_docs
 
 
 def process_image(uploaded_path: str, filename: str) -> List[Document]:
@@ -121,36 +132,31 @@ def process_image(uploaded_path: str, filename: str) -> List[Document]:
     return [Document(page_content=text, metadata={"source": filename})]
 
 
+def process_text_file(uploaded_path: str, filename: str) -> List[Document]:
+    with open(uploaded_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    return [Document(page_content=text, metadata={"source": filename})]
+
+
 def build_vector_store(files: List[UploadFile]):
-    """
-    Build an ObjectBox vector store from the uploaded files and keep
-    a global reference so subsequent queries can use it.
-    """
     global VECTOR_STORE
 
-    # Use a unique directory per embedding session to avoid ObjectBox
-    # "another store is still open using the same path" errors when
-    # rebuilding the vector store multiple times in a single process.
     db_root = os.path.join(os.path.dirname(__file__), "project", "objectbox")
     os.makedirs(db_root, exist_ok=True)
     db_directory = os.path.join(db_root, f"session_{int(time.time())}")
     os.makedirs(db_directory, exist_ok=True)
 
     embeddings = huggingface_instruct_embedding()
-
     docs: List[Document] = []
 
-    # Persist uploads temporarily to disk so loaders/OCR can read them
     for uploaded_file in files:
         if not uploaded_file.filename:
             continue
 
         suffix = os.path.splitext(uploaded_file.filename)[1].lower()
-        temp_path = os.path.join("/tmp", f"docchat_{int(time.time() * 1000)}_{uploaded_file.filename}")
-
-        # Basic identifiers for later filtering / multi-user support
-        document_id = str(uuid.uuid4())
-        user_id = "local-user"
+        temp_path = os.path.join(
+            "/tmp", f"docchat_{int(time.time() * 1000)}_{uploaded_file.filename}"
+        )
 
         with open(temp_path, "wb") as temp_file:
             temp_file.write(uploaded_file.file.read())
@@ -158,22 +164,21 @@ def build_vector_store(files: List[UploadFile]):
         try:
             if uploaded_file.content_type == "application/pdf" or suffix == ".pdf":
                 documents = process_pdf(temp_path)
-            elif uploaded_file.content_type in ("image/jpeg", "image/png") or suffix in (".jpg", ".jpeg", ".png"):
+            elif uploaded_file.content_type in (
+                "image/jpeg",
+                "image/png",
+            ) or suffix in (".jpg", ".jpeg", ".png"):
                 documents = process_image(temp_path, uploaded_file.filename)
+            elif suffix in (".txt", ".md"):
+                documents = process_text_file(temp_path, uploaded_file.filename)
             else:
-                # Skip unsupported types but do not fail the entire request
                 continue
 
-            # Enrich metadata for each document page / image
             for d in documents:
                 meta = dict(d.metadata or {})
-                meta.setdefault("source", uploaded_file.filename)
-                meta.setdefault("source_name", uploaded_file.filename)
-                meta.setdefault("document_id", document_id)
-                meta.setdefault("user_id", user_id)
-                # For PDFs, page is usually present; for others, leave as None
+                meta["source"] = uploaded_file.filename
                 if "page" not in meta:
-                    meta["page"] = 0 if suffix == ".pdf" else None
+                    meta["page"] = None
                 d.metadata = meta
 
             docs.extend(documents)
@@ -182,28 +187,16 @@ def build_vector_store(files: List[UploadFile]):
                 os.remove(temp_path)
 
     if not docs:
-        raise HTTPException(status_code=400, detail="No supported documents were uploaded.")
+        raise HTTPException(
+            status_code=400, detail="No supported documents were uploaded."
+        )
 
-    # Use smaller, overlapping chunks to preserve context and improve retrieval quality
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=128)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
     final_documents = text_splitter.split_documents(docs)
-
-    # Derive lightweight section titles / heading hints per chunk
-    def infer_section_title(text: str) -> Optional[str]:
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return None
-        first = lines[0]
-        return first if len(first) <= 120 else first[:117] + "..."
-
-    for d in final_documents:
-        meta = dict(d.metadata or {})
-        if not meta.get("section_title"):
-            meta["section_title"] = infer_section_title(d.page_content)
-        if not meta.get("heading_hierarchy"):
-            title = meta.get("section_title")
-            meta["heading_hierarchy"] = [title] if title else []
-        d.metadata = meta
 
     VECTOR_STORE = ObjectBox.from_documents(
         final_documents,
@@ -222,9 +215,6 @@ def health():
 
 @app.post("/embed")
 async def embed_documents(files: List[UploadFile] = File(...)):
-    """
-    Upload one or more PDF or image files and build the vector database.
-    """
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
@@ -233,95 +223,120 @@ async def embed_documents(files: List[UploadFile] = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error embedding documents: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Error embedding documents: {e}"
+        )
 
-    return {"message": "Documents embedded successfully.", "document_chunks": doc_count}
+    return {
+        "message": "Documents embedded successfully.",
+        "document_chunks": doc_count,
+    }
 
 
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(payload: QueryRequest):
-    """
-    Ask a question based on the previously uploaded and embedded documents.
-    """
     if VECTOR_STORE is None:
-        raise HTTPException(status_code=400, detail="No vector store available. Please upload and embed documents first.")
+        raise HTTPException(
+            status_code=400,
+            detail="No vector store available. Please upload and embed documents first.",
+        )
 
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
 
-    document_chain = create_stuff_documents_chain(groq_llm(), prompt)
-
-    # First: manual similarity search so we can compute confidence scores.
     try:
-        results: List[Tuple[Document, float]] = VECTOR_STORE.similarity_search_with_score(
-            payload.question, k=8
+        results: List[Tuple[Document, float]] = (
+            VECTOR_STORE.similarity_search_with_score(payload.question, k=15)
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error during retrieval: {e}")
 
     if not results:
         return QueryResponse(
-            answer="I couldn't find a reliable answer in your documents.",
+            answer="I couldn't find any relevant content in your documents.",
             response_time=0.0,
             sources=[],
+            confidence="none",
         )
 
-    # Many vector stores return distance where lower is better.
-    # Convert to a rough similarity in [0, 1] using 1 / (1 + distance).
-    sims = [1.0 / (1.0 + float(score)) for _, score in results]
-    max_sim = max(sims)
-    top3_sim = sims[:3]
-    avg_top3 = sum(top3_sim) / len(top3_sim)
+    results = deduplicate_chunks(results)
 
-    high_confidence = max_sim >= 0.75 or avg_top3 >= 0.7
+    reranker = get_reranker()
+    pairs = [(payload.question, doc.page_content) for doc, _ in results]
+    rerank_scores = reranker.predict(pairs).tolist()
 
-    docs = [doc for doc, _ in results]
+    ranked = sorted(
+        zip(results, rerank_scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
 
-    start = time.process_time()
+    top_n = min(5, len(ranked))
+    top_items = ranked[:top_n]
+    top_results = [(doc, orig) for (doc, orig), _ in top_items]
+    top_rerank = [rs for _, rs in top_items]
 
-    if high_confidence:
-        # High-confidence path: let the LLM synthesize an answer from the top chunks.
-        try:
-            response = document_chain.invoke({"input": payload.question, "context": docs})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error during retrieval: {e}")
+    best = sigmoid(top_rerank[0])
+    avg3 = sum(sigmoid(s) for s in top_rerank[: min(3, len(top_rerank))]) / min(
+        3, len(top_rerank)
+    )
 
-        answer = (response.get("answer") or "").strip()
+    if best >= 0.85 or avg3 >= 0.75:
+        confidence = "high"
+    elif best >= 0.55 or avg3 >= 0.45:
+        confidence = "medium"
     else:
-        # Low-confidence path: don't hallucinate, just explain and show snippets.
-        answer = (
-            "I couldn't find a reliable answer in your documents. "
-            "Here are the most relevant snippets I found; you may want to review these sections."
-        )
+        confidence = "low"
 
-    elapsed = time.process_time() - start
+    context_parts: List[str] = []
+    for i, (doc, _) in enumerate(top_results, start=1):
+        meta = doc.metadata or {}
+        src = meta.get("source", "Document")
+        page = meta.get("page")
+        label = f"[Excerpt {i} — {src}"
+        if page is not None:
+            label += f", Page {page + 1}"
+        label += "]"
+        context_parts.append(f"{label}\n{doc.page_content}")
+
+    context_str = "\n\n---\n\n".join(context_parts)
+
+    start = time.perf_counter()
+
+    try:
+        llm = groq_llm()
+        messages = prompt.format_messages(context=context_str, input=payload.question)
+        response = llm.invoke(messages)
+        answer = response.content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during generation: {e}")
+
+    elapsed = time.perf_counter() - start
 
     sources: List[SourceChunk] = []
-    for doc, _score in results:
-        metadata = getattr(doc, "metadata", {}) or {}
+    for (doc, _), rs in top_items:
+        metadata = doc.metadata or {}
         sources.append(
             SourceChunk(
-                content=getattr(doc, "page_content", ""),
-                source=str(
-                    metadata.get("source_name")
-                    or metadata.get("source")
-                    or metadata.get("file_path")
-                    or ""
-                ),
-                page=metadata.get("page", None),
+                content=doc.page_content,
+                source=metadata.get("source", ""),
+                page=metadata.get("page"),
+                relevance=round(sigmoid(rs), 3),
             )
         )
 
     if not answer:
         answer = "No answer could be generated from the current document context."
 
-    return QueryResponse(answer=answer, response_time=elapsed, sources=sources)
+    return QueryResponse(
+        answer=answer,
+        response_time=elapsed,
+        sources=sources,
+        confidence=confidence,
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)
-
-
-

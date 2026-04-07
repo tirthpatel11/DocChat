@@ -1,23 +1,25 @@
 # DocChat
 
-A powerful document Q&A application that uses AI to answer questions from your PDFs and images. Built with FastAPI backend and React frontend.
+A powerful document Q&A application that uses AI to answer questions from your PDFs, images, and text files. Built with a FastAPI backend and a React chat interface.
 
 ## Features
 
-- 📄 **Multi-format Support**: Upload PDFs and images (JPG, PNG)
-- 🔍 **Table Extraction**: Automatically extracts and indexes tables from PDFs for structured data Q&A
-- 🧠 **Smart Chunking**: Advanced chunking with metadata (page numbers, section titles, headings)
-- 📊 **Source Citations**: See exactly which document pages and sections were used to answer your questions
-- 🎯 **Confidence Scoring**: Low-confidence answers show raw snippets instead of hallucinating
-- ⚡ **Fast Retrieval**: Optimized vector search with similarity thresholds
+- **Multi-format Support** — Upload PDFs, images (JPG, PNG), and text files (TXT, MD)
+- **Table Extraction** — Automatically extracts and indexes tables from PDFs for structured data Q&A
+- **Smart Chunking** — 800-token chunks with 200-token overlap and metadata (page numbers, section titles)
+- **Source Citations** — See exactly which document pages and sections were used, with relevance scores
+- **Confidence Scoring** — Each answer is tagged with a confidence level (high / medium / low)
+- **Chunk Deduplication** — Overlapping chunks are deduplicated so retrieval slots aren't wasted
+- **Markdown Answers** — Responses are rendered as Markdown with tables, lists, and code blocks
+- **Chat Interface** — Conversational UI with full message history per session
 
 ## Tech Stack
 
 - **Backend**: FastAPI, LangChain, Groq LLM, ObjectBox Vector Store
-- **Frontend**: React, Vite, Axios
-- **AI Models**: 
-  - LLM: Llama 3.1 8B Instant (via Groq)
-  - Embeddings: BAAI/bge-small-en-v1.5
+- **Frontend**: React 18, Vite, Axios, react-markdown
+- **AI Models**:
+  - LLM: Llama 3.3 70B Versatile (via Groq)
+  - Embeddings: BAAI/bge-base-en-v1.5 (768-d)
 
 ## Setup
 
@@ -53,7 +55,7 @@ cd frontend
 npm install
 ```
 
-2. (Optional) Create `.env` file if backend is on different URL:
+2. (Optional) Create `.env` file if backend is on a different URL:
 ```bash
 echo "VITE_API_BASE_URL=http://localhost:8000" > .env
 ```
@@ -67,25 +69,26 @@ npm run dev
 
 ## Usage
 
-1. Upload your PDF or image documents
-2. Click "Embed documents" to index them
-3. Ask questions about your documents
-4. View answers with source citations showing which pages were used
+1. Upload your PDF, image, or text documents using the sidebar
+2. Click **Embed documents** to index them
+3. Ask questions in the chat input
+4. View answers (rendered as Markdown) with source citations and relevance scores
 
 ## Project Structure
 
 ```
 DocChat-main/
 ├── app/
-│   ├── backend.py          # FastAPI backend server
-│   ├── utils.py            # LLM and embedding utilities
-│   ├── config.py           # Configuration management
-│   └── project/            # ObjectBox vector database
+│   ├── backend.py          # FastAPI backend — RAG pipeline, vector store, query endpoint
+│   ├── utils.py            # LLM and embedding model configuration
+│   ├── config.py           # Environment variable management
+│   └── project/            # ObjectBox vector database (gitignored)
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx         # Main React component
-│   │   ├── main.jsx        # Entry point
-│   │   └── styles.css      # Styling
+│   │   ├── App.jsx         # Chat interface with message history and markdown rendering
+│   │   ├── main.jsx        # React entry point
+│   │   └── styles.css      # Dark-theme chat layout styles
+│   ├── index.html
 │   └── package.json
 └── requirements.txt        # Python dependencies
 ```
@@ -93,4 +96,3 @@ DocChat-main/
 ## License
 
 MIT
-
